@@ -1,11 +1,14 @@
 (ns proletarian.db
   {:no-doc true}
   (:require [clojure.edn :as edn]
+            [jsonista.core :as json]
             [proletarian.protocols :as p])
-  (:import (java.sql Connection Timestamp)
+  (:import (com.fasterxml.jackson.core JsonGenerator)
+           (java.sql Connection Timestamp)
+           (java.time Instant)
            (java.util UUID)
            (javax.sql DataSource)
-           (java.time Instant)))
+           (org.postgresql.util PGobject)))
 
 (set! *warn-on-reflection* true)
 
@@ -13,12 +16,26 @@
 (def DEFAULT_JOB_TABLE "proletarian.job")
 (def DEFAULT_ARCHIVED_JOB_TABLE "proletarian.archived_job")
 
+(defn string-mapper
+  [x  ^JsonGenerator gen]
+  (.writeString gen (str x)))
+
+(def object-mapper
+  (json/object-mapper
+    {:encode-key-fn name
+     :decode-key-fn keyword
+     :encoders      {java.time.LocalDate     string-mapper
+                     java.time.LocalDateTime string-mapper}}))
+(defn ->json
+  [x]
+  (json/write-value-as-string x object-mapper))
+
 (def enqueue-sql
   (memoize
     (fn [job-table]
       (format
         "INSERT INTO %s (job_id, queue, job_type, payload, attempts, enqueued_at, process_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?)"
+         VALUES (?, ?, ?, ?::jsonb, ?, ?, ?)"
         job-table))))
 
 (defn enqueue!
@@ -63,12 +80,22 @@
                           :enqueued-at (.toInstant (.getTimestamp rs 6))
                           :process-at (.toInstant (.getTimestamp rs 7))}))))
 
+(defn ->pgobject
+  "Transforms Clojure data to a PGobject that contains the data as
+  JSON. PGObject type defaults to `jsonb` but can be changed via
+  metadata key `:pgtype`"
+  [x]
+  (let [pgtype (or (:pgtype (meta x)) "jsonb")]
+    (doto (PGobject.)
+      (.setType pgtype)
+      (.setValue (->json x)))))
+
 (def archive-job-sql
   (memoize
     (fn [archived-job-table job-table]
       (format
         "INSERT INTO %s (job_id, queue, job_type, payload, attempts, status, enqueued_at, process_at, finished_at)
-         SELECT job_id, queue, job_type, payload, attempts + 1, ?, enqueued_at, process_at, ?
+         SELECT job_id, queue, job_type, ?, attempts + 1, ?, enqueued_at, process_at, ?
          FROM %s
          WHERE job_id = ?"
         archived-job-table job-table))))
@@ -78,12 +105,14 @@
    {::keys [job-table archived-job-table]}
    job-id
    status
-   finished-at]
+   finished-at
+   payload]
   (with-open [stmt (.prepareStatement conn (archive-job-sql archived-job-table job-table))]
     (doto stmt
-      (.setString 1 (str status))
-      (.setTimestamp 2 (Timestamp/from ^Instant finished-at))
-      (.setObject 3 job-id)
+      (.setObject 1 (->pgobject payload))
+      (.setString 2 (str status))
+      (.setTimestamp 3 (Timestamp/from ^Instant finished-at))
+      (.setObject 4 job-id)
       (.executeUpdate))))
 
 (def delete-job-sql
